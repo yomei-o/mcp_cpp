@@ -27,10 +27,12 @@
 * `tests/run_tests.sh`：公式 Python クライアント → mcp_cpp、mcp_cpp クライアント → mcp_cpp、
   mcp_cpp クライアント → Python 参照サーバ、を stdio と HTTP で計6通り、すべて PASS。
 
+* Claude Code 2.1.316 に `claude mcp add cpp-demo -- <demo_server.exe>`（local スコープ）で登録し、`claude mcp list` で
+  Connected。`claude -p` の別セッションに add / stats / greet / リソース greeting://太郎 を使わせ、4つとも正しい結果が返った。
+
 ## 次にやること
 
 1. modern 世代（2026-07-28：`server/discover`、リクエストごとの envelope）。
 2. サーバからクライアントへのリクエスト（sampling/createMessage、elicitation、roots/list）。
 3. tools / resources / prompts の listChanged 通知、resources/subscribe、completion/complete の中身。
-4. Claude Code に実際に登録して使う確認（`claude mcp add`）。
 5. 既存の C++ 資産（ppocr_cpp や yolo_lpr_cpp）を MCP ツールとして公開するサンプル。
