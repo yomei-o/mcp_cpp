@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.16)
+project(mcp_cpp CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+add_library(mcp_cpp INTERFACE)
+target_include_directories(mcp_cpp INTERFACE include third_party)
+find_package(Threads REQUIRED)
+target_link_libraries(mcp_cpp INTERFACE Threads::Threads)
+if(WIN32)
+  target_link_libraries(mcp_cpp INTERFACE ws2_32)
+  target_compile_definitions(mcp_cpp INTERFACE _WIN32_WINNT=0x0A00)
+endif()
+if(MSVC)
+  target_compile_options(mcp_cpp INTERFACE /utf-8 /bigobj)
+endif()
+
+foreach(ex demo_server)
+  add_executable(${ex} examples/${ex}.cpp)
+  target_link_libraries(${ex} PRIVATE mcp_cpp)
+endforeach()
