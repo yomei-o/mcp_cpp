@@ -293,6 +293,8 @@ public:
     ~HttpTransport() override { close(); }
 
     void set_protocol_version(const std::string& v) { protocol_ = v; }
+    // Modern protocol: every POST carries Mcp-Method / Mcp-Name; no session.
+    void set_modern(bool m) { modern_ = m; }
 
     json request(const json& msg, const Handler& on_message, double timeout_s) override {
         json response;
@@ -324,8 +326,16 @@ private:
         req.method = "POST";
         req.path = path_;
         req.headers = {{"Accept", "application/json, text/event-stream"}};
-        if (!session_.empty()) req.headers.emplace("Mcp-Session-Id", session_);
+        if (!session_.empty() && !modern_) req.headers.emplace("Mcp-Session-Id", session_);
         if (!protocol_.empty()) req.headers.emplace("MCP-Protocol-Version", protocol_);
+        if (modern_ && msg.contains("method")) {
+            std::string method = msg["method"].get<std::string>();
+            req.headers.emplace("Mcp-Method", method);
+            const json p = msg.value("params", json::object());
+            const char* key = method == "resources/read" ? "uri" : (method == "tools/call" || method == "prompts/get") ? "name" : nullptr;
+            if (key && p.contains(key) && p[key].is_string())
+                req.headers.emplace("Mcp-Name", detail::encode_header_value(p[key].get<std::string>()));
+        }
         req.set_header("Content-Type", "application/json");
         req.body = detail::dump(msg);
         std::string body, sse_buf;
@@ -376,6 +386,7 @@ private:
     }
 
     std::string base_, path_, session_, protocol_;
+    bool modern_ = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -401,7 +412,42 @@ public:
     }
     double timeout = 300;  // seconds per request
 
-    // The handshake; returns the server's InitializeResult.
+    // Connect: "auto" tries the modern protocol (server/discover) and falls back to the
+    // initialize handshake; "legacy" goes straight to initialize. Returns
+    // {protocolVersion, capabilities, serverInfo, instructions?} either way.
+    json connect(const std::string& mode = "auto", const std::string& name = "mcp_cpp-client",
+                 const std::string& version = sdk_version) {
+        client_info_ = {{"name", name}, {"version", version}};
+        if (mode != "legacy") {
+            const std::string want = modern_protocol_versions().front();
+            modern_version_ = want;
+            set_transport_modern(true);
+            try {
+                json r = call("server/discover", json::object());
+                const json sv = r.value("supportedVersions", json::array());
+                if (std::find(sv.begin(), sv.end(), json(want)) != sv.end()) {
+                    info_ = {{"protocolVersion", want},
+                             {"capabilities", r.value("capabilities", json::object())},
+                             {"serverInfo", r.value("_meta", json::object()).value(META_SERVER_INFO, json::object())}};
+                    if (r.contains("instructions")) info_["instructions"] = r["instructions"];
+                    return info_;
+                }
+            } catch (const Error& e) {
+                if (e.code == UNSUPPORTED_PROTOCOL_VERSION && e.data.is_object()) {
+                    bool any_handshake = false;
+                    for (auto& v : e.data.value("supported", json::array()))
+                        for (auto& h : protocol_versions()) any_handshake = any_handshake || v == h;
+                    if (!any_handshake) throw;  // modern-only server with no version in common
+                }
+            }
+            modern_version_.clear();
+            set_transport_modern(false);
+        }
+        return initialize(name, version);
+    }
+    bool modern() const { return !modern_version_.empty(); }
+
+    // The handshake (legacy protocol); returns the server's InitializeResult.
     json initialize(const std::string& name = "mcp_cpp-client", const std::string& version = sdk_version) {
         json r = call("initialize", {{"protocolVersion", protocol_versions().front()},
                                      {"capabilities", json::object()},
@@ -432,12 +478,26 @@ public:
     json get_prompt(const std::string& name, const json& arguments = json::object()) {
         return call("prompts/get", {{"name", name}, {"arguments", arguments}});
     }
-    void set_logging_level(const std::string& level) { call("logging/setLevel", {{"level", level}}); }
-    void ping() { call("ping", json::object()); }
+    // Legacy: logging/setLevel. Modern: sent as the per-request log level from now on.
+    void set_logging_level(const std::string& level) {
+        if (modern()) log_level_ = level;
+        else call("logging/setLevel", {{"level", level}});
+    }
+    void ping() {  // removed in the modern protocol
+        if (!modern()) call("ping", json::object());
+    }
 
     // Generic request; throws mcp::Error on a JSON-RPC error.
     json call(const std::string& method, const json& params, ProgressFn progress = {}, const std::string& token = "") {
-        json msg = {{"jsonrpc", "2.0"}, {"id", ++*next_id_}, {"method", method}, {"params", params}};
+        json p = params;
+        if (modern()) {  // the per-request envelope
+            json& meta = p["_meta"];
+            meta[META_PROTOCOL_VERSION] = modern_version_;
+            meta[META_CLIENT_CAPABILITIES] = json::object();
+            meta[META_CLIENT_INFO] = client_info_;
+            if (!log_level_.empty()) meta[META_LOG_LEVEL] = log_level_;
+        }
+        json msg = {{"jsonrpc", "2.0"}, {"id", ++*next_id_}, {"method", method}, {"params", p}};
         json r = t_->request(msg, [&](const json& m) { route(m, progress, token); }, timeout);
         if (r.contains("error"))
             throw Error(r["error"].value("code", INTERNAL_ERROR), r["error"].value("message", std::string("error")),
@@ -469,8 +529,16 @@ private:
         }
     }
 
+    void set_transport_modern(bool m) {
+        if (auto* h = dynamic_cast<HttpTransport*>(t_.get())) {
+            h->set_modern(m);
+            h->set_protocol_version(m ? modern_protocol_versions().front() : "");
+        }
+    }
+
     std::unique_ptr<Transport> t_;
-    json info_;
+    json info_, client_info_;
+    std::string modern_version_, log_level_;
     LogFn log_;
     std::shared_ptr<std::atomic<long long>> next_id_ = std::make_shared<std::atomic<long long>>(0);
 };

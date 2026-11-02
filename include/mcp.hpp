@@ -55,8 +55,24 @@ inline const std::vector<std::string>& protocol_versions() {
     return v;
 }
 
+// Per-request-envelope ("modern") protocol revisions: no initialize, no sessions.
+inline const std::vector<std::string>& modern_protocol_versions() {
+    static const std::vector<std::string> v = {"2026-07-28"};
+    return v;
+}
+
+// Keys of the modern per-request envelope in params._meta.
+inline constexpr const char* META_PROTOCOL_VERSION = "io.modelcontextprotocol/protocolVersion";
+inline constexpr const char* META_CLIENT_CAPABILITIES = "io.modelcontextprotocol/clientCapabilities";
+inline constexpr const char* META_CLIENT_INFO = "io.modelcontextprotocol/clientInfo";
+inline constexpr const char* META_LOG_LEVEL = "io.modelcontextprotocol/logLevel";
+inline constexpr const char* META_SERVER_INFO = "io.modelcontextprotocol/serverInfo";
+
 // JSON-RPC / MCP error codes
 enum : int {
+    HEADER_MISMATCH = -32020,
+    MISSING_REQUIRED_CLIENT_CAPABILITY = -32021,
+    UNSUPPORTED_PROTOCOL_VERSION = -32022,
     PARSE_ERROR = -32700,
     INVALID_REQUEST = -32600,
     METHOD_NOT_FOUND = -32601,
@@ -138,6 +154,21 @@ inline std::string base64_decode(const std::string& in) {
     }
     return out;
 }
+
+namespace detail {
+// Header values that are not plain printable ASCII travel as =?base64?...?= (modern HTTP).
+inline std::string encode_header_value(const std::string& v) {
+    bool plain = !v.empty() ? (v.front() != ' ' && v.back() != ' ') : true;
+    for (unsigned char c : v) plain = plain && c >= 0x20 && c <= 0x7E;
+    if (plain && !(v.rfind("=?base64?", 0) == 0 && v.size() >= 11 && v.compare(v.size() - 2, 2, "?=") == 0)) return v;
+    return "=?base64?" + base64_encode(v) + "?=";
+}
+inline std::string decode_header_value(const std::string& v) {
+    if (v.rfind("=?base64?", 0) == 0 && v.size() >= 11 && v.compare(v.size() - 2, 2, "?=") == 0)
+        return base64_decode(v.substr(9, v.size() - 11));
+    return v;
+}
+}  // namespace detail
 
 // ---------------------------------------------------------------------------
 // Content blocks (tool results, prompt messages)
@@ -407,7 +438,9 @@ public:
     };
 
     explicit Server(std::string name, std::string version = "0.1.0", std::string instructions = "")
-        : name_(std::move(name)), version_(std::move(version)), instructions_(std::move(instructions)) {}
+        : name_(std::move(name)), version_(std::move(version)), instructions_(std::move(instructions)) {
+        modern_.era = 2;
+    }
     Server(const Server&) = delete;
     Server& operator=(const Server&) = delete;
 
@@ -529,6 +562,7 @@ public:
         std::shared_ptr<std::atomic<int>> min_level = std::make_shared<std::atomic<int>>(0);
         std::mutex m;
         std::map<std::string, std::shared_ptr<std::atomic<bool>>> running;  // request id (dumped) -> cancel flag
+        int era = 0;  // 0: undecided, 1: initialize handshake, 2: modern per-request envelope
         std::chrono::steady_clock::time_point touched = std::chrono::steady_clock::now();
     };
 
@@ -553,8 +587,23 @@ public:
             return nullptr;
         }
         const json id = msg["id"];
+        const json meta = params.contains("_meta") && params["_meta"].is_object() ? params["_meta"] : json::object();
+        if (method == "initialize") {
+            if (s.era == 2)
+                return error_response(id, UNSUPPORTED_PROTOCOL_VERSION,
+                                      "connection is serving the " + modern_protocol_versions().front() +
+                                          " protocol; the initialize handshake is not accepted",
+                                      {{"supported", modern_protocol_versions()}, {"requested", params.value("protocolVersion", "")}});
+            s.era = 1;
+        } else if (s.era == 0 && (meta.contains(META_PROTOCOL_VERSION) || method == "server/discover")) {
+            s.era = 2;
+        }
+        bool modern = s.era == 2;
         try {
-            return {{"jsonrpc", "2.0"}, {"id", id}, {"result", dispatch(method, params, id, s, send)}};
+            if (modern) check_envelope(meta);
+            json result = dispatch(method, params, id, s, send, modern);
+            if (modern) decorate(method, result);
+            return {{"jsonrpc", "2.0"}, {"id", id}, {"result", result}};
         } catch (const Error& e) {
             return error_response(id, e.code, e.what(), e.data);
         } catch (const detail::Cancelled&) {
@@ -675,9 +724,49 @@ private:
         return {{"jsonrpc", "2.0"}, {"id", id}, {"error", e}};
     }
 
+    // Modern envelope ladder (no headers): _meta keys present, version a supported string.
+    static void check_envelope(const json& meta) {
+        if (!meta.contains(META_PROTOCOL_VERSION) || !meta.contains(META_CLIENT_CAPABILITIES))
+            throw Error(INVALID_PARAMS, std::string("params._meta must be an object carrying the required '") +
+                                            META_PROTOCOL_VERSION + "' and '" + META_CLIENT_CAPABILITIES + "' envelope keys");
+        const json& pv = meta[META_PROTOCOL_VERSION];
+        if (!pv.is_string()) throw Error(INVALID_PARAMS, "the protocol-version envelope value must be a string");
+        const auto& mv = modern_protocol_versions();
+        if (std::find(mv.begin(), mv.end(), pv.get<std::string>()) == mv.end())
+            throw Error(UNSUPPORTED_PROTOCOL_VERSION, "Unsupported protocol version", {{"supported", mv}, {"requested", pv}});
+    }
+
+    // Modern results carry resultType and the server info; cacheable ones a cache hint.
+    void decorate(const std::string& method, json& result) const {
+        result["resultType"] = "complete";
+        result["_meta"][META_SERVER_INFO] = {{"name", name_}, {"version", version_}};
+        static const std::set<std::string> cacheable = {"tools/list", "resources/list", "resources/templates/list",
+                                                        "prompts/list", "resources/read", "server/discover"};
+        if (cacheable.count(method)) {
+            result["cacheScope"] = "private";
+            result["ttlMs"] = 0;
+        }
+    }
+
+    json capabilities(bool modern) {
+        json caps = modern ? json::object() : json{{"logging", json::object()}};
+        std::lock_guard<std::mutex> lk(m_);
+        if (!tools_.empty()) caps["tools"] = {{"listChanged", false}};
+        if (!resources_.empty()) caps["resources"] = {{"subscribe", false}, {"listChanged", false}};
+        if (!prompts_.empty()) caps["prompts"] = {{"listChanged", false}};
+        return caps;
+    }
+
     json dispatch(const std::string& method, const json& params, const json& id, Session& s,
-                  const std::function<void(const json&)>& send) {
+                  const std::function<void(const json&)>& send, bool modern = false) {
         if (method == "initialize") return initialize(params, s);
+        if (method == "server/discover") {
+            json r = {{"supportedVersions", modern_protocol_versions()}, {"capabilities", capabilities(true)}};
+            if (!instructions_.empty()) r["instructions"] = instructions_;
+            return r;
+        }
+        if (modern && (method == "ping" || method == "logging/setLevel"))  // removed in the modern protocol
+            throw Error(METHOD_NOT_FOUND, "Method not found", method);
         if (method == "ping") return json::object();
         if (method == "tools/list") {
             json list = json::array();
@@ -691,7 +780,7 @@ private:
             }
             return {{"tools", list}};
         }
-        if (method == "tools/call") return call_tool(params, id, s, send);
+        if (method == "tools/call") return call_tool(params, id, s, send, modern);
         if (method == "resources/list" || method == "resources/templates/list") {
             bool templates = method == "resources/templates/list";
             json list = json::array();
@@ -773,21 +862,15 @@ private:
         s.protocol_version = std::find(vs.begin(), vs.end(), want) != vs.end() ? want : vs.front();
         s.client_info = params.value("clientInfo", json::object());
         s.client_capabilities = params.value("capabilities", json::object());
-        json caps = {{"logging", json::object()}};
-        {
-            std::lock_guard<std::mutex> lk(m_);
-            if (!tools_.empty()) caps["tools"] = {{"listChanged", false}};
-            if (!resources_.empty()) caps["resources"] = {{"subscribe", false}, {"listChanged", false}};
-            if (!prompts_.empty()) caps["prompts"] = {{"listChanged", false}};
-        }
         json r = {{"protocolVersion", s.protocol_version},
-                  {"capabilities", caps},
+                  {"capabilities", capabilities(false)},
                   {"serverInfo", {{"name", name_}, {"version", version_}}}};
         if (!instructions_.empty()) r["instructions"] = instructions_;
         return r;
     }
 
-    json call_tool(const json& params, const json& id, Session& s, const std::function<void(const json&)>& send) {
+    json call_tool(const json& params, const json& id, Session& s, const std::function<void(const json&)>& send,
+                   bool modern = false) {
         std::string name = params.value("name", "");
         std::shared_ptr<Tool> t;
         {
@@ -803,6 +886,11 @@ private:
         if (ctx.meta_.contains("progressToken")) ctx.progress_token_ = ctx.meta_["progressToken"];
         ctx.cancelled_ = std::make_shared<std::atomic<bool>>(false);
         ctx.min_level_ = s.min_level;
+        if (modern) {  // logs only when this request opted in with a level
+            auto lv = ctx.meta_.value(META_LOG_LEVEL, std::string());
+            ctx.min_level_ = std::make_shared<std::atomic<int>>(lv.empty() ? 1000 : log_level_rank(lv));
+            ctx.client_info_ = ctx.meta_.value(META_CLIENT_INFO, json::object());
+        }
         ctx.session_id_ = s.id;
         ctx.client_info_ = s.client_info;
         std::string key = detail::dump(id);
@@ -845,16 +933,130 @@ private:
         res.set_content(detail::dump(error_response(id, code, msg)), "application/json");
     }
 
+    static int http_status_for(int code) {
+        switch (code) {
+            case PARSE_ERROR: case INVALID_REQUEST: case INVALID_PARAMS: case HEADER_MISMATCH:
+            case MISSING_REQUIRED_CLIENT_CAPABILITY: case UNSUPPORTED_PROTOCOL_VERSION: return 400;
+            case METHOD_NOT_FOUND: return 404;
+            default: return 200;
+        }
+    }
+
+    // Modern (per-request envelope) HTTP: stateless, one message per POST, routing headers
+    // MCP-Protocol-Version / Mcp-Method / Mcp-Name (and Mcp-Param-*) must agree with the body.
+    void http_post_modern(const httplib::Request& req, httplib::Response& res, const json& msg) {
+        json id = msg.is_object() && msg.contains("id") ? msg["id"] : json(nullptr);
+        auto reject = [&](int code, const std::string& m, const json& data = nullptr) {
+            res.status = http_status_for(code);
+            res.set_content(detail::dump(error_response(id, code, m, data)), "application/json");
+        };
+        if (!msg.is_object()) return reject(INVALID_REQUEST, "a modern request carries exactly one JSON-RPC message");
+        for (const char* h : {"MCP-Protocol-Version", "Mcp-Method", "Mcp-Name"})
+            if (req.get_header_value_count(h) > 1) return reject(HEADER_MISMATCH, std::string(h) + " header appears more than once");
+        const std::string method = msg.value("method", "");
+        const json params = msg.contains("params") && msg["params"].is_object() ? msg["params"] : json::object();
+        if (!msg.contains("id")) {  // notification
+            if (method == "notifications/cancelled") handle(msg, modern_, nullptr);
+            res.status = 202;
+            return;
+        }
+        const json meta = params.contains("_meta") && params["_meta"].is_object() ? params["_meta"] : json();
+        if (!meta.is_object() || !meta.contains(META_PROTOCOL_VERSION) || !meta.contains(META_CLIENT_CAPABILITIES))
+            return reject(INVALID_PARAMS, std::string("params._meta must be an object carrying the required '") +
+                                              META_PROTOCOL_VERSION + "' and '" + META_CLIENT_CAPABILITIES + "' envelope keys");
+        if (!req.has_header("MCP-Protocol-Version") || json(req.get_header_value("MCP-Protocol-Version")) != meta[META_PROTOCOL_VERSION])
+            return reject(HEADER_MISMATCH, "mcp-protocol-version header does not match the request envelope's protocol version");
+        if (req.get_header_value("Mcp-Method") != method)
+            return reject(HEADER_MISMATCH, "mcp-method header does not match the request body's method");
+        static const std::map<std::string, std::string> name_key = {
+            {"tools/call", "name"}, {"prompts/get", "name"}, {"resources/read", "uri"}};
+        auto nk = name_key.find(method);
+        if (nk != name_key.end() && params.contains(nk->second) && params[nk->second].is_string() &&
+            detail::decode_header_value(req.get_header_value("Mcp-Name")) != params[nk->second].get<std::string>())
+            return reject(HEADER_MISMATCH, "mcp-name header does not match the request body's '" + nk->second + "' parameter");
+        if (method == "tools/call") {
+            std::string why = check_param_headers(req, params);
+            if (!why.empty()) return reject(HEADER_MISMATCH, why);
+        }
+        bool sse = req.get_header_value("Accept").find("text/event-stream") != std::string::npos;
+        if (!sse || method != "tools/call") {
+            json r = handle(msg, modern_, nullptr);
+            if (r.contains("error")) res.status = http_status_for(r["error"].value("code", 0));
+            res.set_content(detail::dump(r), "application/json");
+            return;
+        }
+        stream_response(res, std::vector<json>{msg}, modern_);
+    }
+
+    // Mcp-Param-<token> headers for properties annotated "x-mcp-header": <token> must mirror the arguments.
+    std::string check_param_headers(const httplib::Request& req, const json& params) {
+        std::shared_ptr<Tool> t;
+        {
+            std::lock_guard<std::mutex> lk(m_);
+            for (auto& x : tools_)
+                if (x->name == params.value("name", "")) t = x;
+        }
+        if (!t || !t->input_schema.contains("properties")) return "";
+        const json args = params.value("arguments", json::object());
+        for (auto& [prop, sch] : t->input_schema["properties"].items()) {
+            if (!sch.is_object() || !sch.contains("x-mcp-header") || !sch["x-mcp-header"].is_string()) continue;
+            std::string header = "Mcp-Param-" + sch["x-mcp-header"].get<std::string>();
+            bool has_h = req.has_header(header);
+            bool has_v = args.is_object() && args.contains(prop) && !args[prop].is_null();
+            if (has_h && req.get_header_value_count(header) > 1) return header + " header appears more than once";
+            if (!has_v && has_h) return header + " header is present but the request body's '" + prop + "' argument is absent";
+            if (has_v && !has_h) return header + " header is missing for the '" + prop + "' argument";
+            if (!has_v) continue;
+            const json& v = args[prop];
+            std::string rendered = v.is_boolean() ? (v.get<bool>() ? "true" : "false") : v.is_string() ? v.get<std::string>() : v.dump();
+            if (detail::decode_header_value(req.get_header_value(header)) != rendered)
+                return header + " header does not match the request body's '" + prop + "' argument";
+        }
+        return "";
+    }
+
+    // Respond with an SSE stream: notifications produced while handling, then the response(s).
+    void stream_response(httplib::Response& res, std::vector<json> batch, Session& sref) {
+        Session* s = &sref;
+        res.set_header("Cache-Control", "no-cache");
+        res.set_chunked_content_provider("text/event-stream", [this, batch, s](size_t, httplib::DataSink& sink) {
+            bool alive = true;
+            std::mutex wm;
+            auto write = [&](const json& j) {
+                std::lock_guard<std::mutex> lk(wm);
+                std::string ev = "event: message\ndata: " + detail::dump(j) + "\n\n";
+                if (alive && !sink.write(ev.data(), ev.size())) {
+                    alive = false;  // client went away: cancel what it asked for
+                    std::lock_guard<std::mutex> sl(s->m);
+                    for (auto& m : batch)
+                        if (m.is_object() && m.contains("id")) {
+                            auto it = s->running.find(detail::dump(m["id"]));
+                            if (it != s->running.end()) *it->second = true;
+                        }
+                }
+            };
+            for (auto& m : batch) {
+                json r = handle(m, *s, write);
+                if (!r.is_null()) write(r);
+            }
+            sink.done();
+            return true;
+        });
+    }
+
     void http_post(const httplib::Request& req, httplib::Response& res) {
         if (!origin_ok(req)) return json_error(res, 403, nullptr, INVALID_REQUEST, "origin not allowed");
         json msg = json::parse(req.body, nullptr, false);
         if (msg.is_discarded()) return json_error(res, 400, nullptr, PARSE_ERROR, "invalid JSON");
         std::string pv = req.get_header_value("MCP-Protocol-Version");
-        if (!pv.empty()) {
-            const auto& vs = protocol_versions();
-            if (std::find(vs.begin(), vs.end(), pv) == vs.end())
-                return json_error(res, 400, nullptr, INVALID_REQUEST, "unsupported MCP-Protocol-Version " + pv);
-        }
+        const auto& hv = protocol_versions();
+        bool handshake_pv = std::find(hv.begin(), hv.end(), pv) != hv.end();
+        bool body_modern = msg.is_object() && msg.contains("params") && msg["params"].is_object() &&
+                           msg["params"].contains("_meta") && msg["params"]["_meta"].is_object() &&
+                           msg["params"]["_meta"].contains(META_PROTOCOL_VERSION);
+        if ((!pv.empty() && !handshake_pv) || (pv.empty() && req.get_header_value("Mcp-Session-Id").empty() &&
+                                                (body_modern || (msg.is_object() && msg.value("method", "") == "server/discover"))))
+            return http_post_modern(req, res, msg);
         std::vector<json> batch = msg.is_array() ? msg.get<std::vector<json>>() : std::vector<json>{msg};
         bool any_request = false, has_init = false;
         for (auto& m : batch)
@@ -874,12 +1076,7 @@ private:
         } else {
             std::string sid = req.get_header_value("Mcp-Session-Id");
             json id = batch.size() == 1 && batch[0].is_object() && batch[0].contains("id") ? batch[0]["id"] : json(nullptr);
-            if (sid.empty()) {
-                // e.g. a 2026-era client probing with server/discover: answer as an unknown method
-                if (batch.size() == 1 && batch[0].is_object() && batch[0].value("method", "") == "server/discover")
-                    return json_error(res, 200, id, METHOD_NOT_FOUND, "method not found: server/discover");
-                return json_error(res, 400, id, INVALID_REQUEST, "missing Mcp-Session-Id (send initialize first)");
-            }
+            if (sid.empty()) return json_error(res, 400, id, INVALID_REQUEST, "missing Mcp-Session-Id (send initialize first)");
             std::lock_guard<std::mutex> lk(sessions_m_);
             auto it = sessions_.find(sid);
             if (it == sessions_.end()) return json_error(res, 404, id, INVALID_REQUEST, "unknown session");
@@ -906,26 +1103,7 @@ private:
             return;
         }
         // tools/call: an SSE stream carrying progress / log notifications, then the response
-        res.set_header("Cache-Control", "no-cache");
-        res.set_chunked_content_provider("text/event-stream", [this, batch, s](size_t, httplib::DataSink& sink) {
-            bool alive = true;
-            std::mutex wm;
-            auto write = [&](const json& j) {
-                std::lock_guard<std::mutex> lk(wm);
-                std::string ev = "event: message\ndata: " + detail::dump(j) + "\n\n";
-                if (alive && !sink.write(ev.data(), ev.size())) {
-                    alive = false;  // client went away: cancel what it asked for
-                    std::lock_guard<std::mutex> sl(s->m);
-                    for (auto& [k, f] : s->running) *f = true;
-                }
-            };
-            for (auto& m : batch) {
-                json r = handle(m, *s, write);
-                if (!r.is_null()) write(r);
-            }
-            sink.done();
-            return true;
-        });
+        stream_response(res, batch, *s);
     }
 
     void prune_sessions() {
@@ -941,6 +1119,7 @@ private:
     std::vector<std::shared_ptr<Prompt>> prompts_;
     std::mutex sessions_m_;
     std::map<std::string, std::shared_ptr<Session>> sessions_;
+    Session modern_;  // modern HTTP is stateless; this only tracks in-flight requests for cancellation (era 2)
     std::set<std::string> allowed_origins_;
 };
 

@@ -2,6 +2,7 @@
 //   client_check --stdio build/Release/demo_server.exe
 //   client_check --stdio python tests/py_ref_server.py
 //   client_check --http http://127.0.0.1:8000/mcp
+//   client_check --legacy --stdio ...   (force the initialize handshake; default: auto = modern first)
 #include "mcp_client.hpp"
 
 static int failures = 0;
@@ -18,14 +19,18 @@ int main(int argc, char** argv) {
         std::cerr << "usage: client_check --stdio <command...> | --http <url>\n";
         return 2;
     }
-    std::string mode = argv[1];
-    std::vector<std::string> rest(argv + 2, argv + argc);
+    int a = 1;
+    std::string proto = "auto";  // --legacy forces the initialize handshake
+    if (std::string(argv[a]) == "--legacy") proto = "legacy", ++a;
+    std::string mode = argv[a];
+    std::vector<std::string> rest(argv + a + 1, argv + argc);
     try {
         mcp::Client c = mode == "--http" ? mcp::Client::http(rest[0]) : mcp::Client::stdio(rest);
         std::vector<std::string> logs;
         c.on_log([&](const std::string& level, const mcp::json& data) { logs.push_back(level + ": " + data.dump()); });
-        mcp::json info = c.initialize();
+        mcp::json info = c.connect(proto);
         std::cout << "server: " << info["serverInfo"].dump() << " protocol " << info["protocolVersion"] << "\n";
+        CHECK(c.modern() == (proto == "auto"), "negotiated era");
 
         std::vector<std::string> names;
         for (auto& t : c.list_tools()) names.push_back(t["name"]);
@@ -48,7 +53,7 @@ int main(int argc, char** argv) {
               "stats error: " + r.dump());
         std::cout << "tools ok\n";
 
-        bool has_logging = info["capabilities"].contains("logging");
+        bool has_logging = c.modern() || info["capabilities"].contains("logging");
         if (has_logging) c.set_logging_level("info");  // only when the server advertises it
         std::vector<double> prog;
         r = c.call_tool("count_slowly", {{"n", 5}},

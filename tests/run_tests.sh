@@ -13,15 +13,21 @@ t() { local name=$1; shift; if timeout 180 "$@" > /tmp/mcp_t.log 2>&1; then echo
 SERVER_NATIVE=$(cygpath -w "$SERVER" 2>/dev/null || echo "$SERVER")
 PY_NATIVE=$(cygpath -w "$(command -v "$PY")" 2>/dev/null || echo "$PY")
 
-t "python client -> C++ server (stdio)" "$PY" tests/py_client_test.py stdio "$SERVER_NATIVE"
-t "C++ client -> C++ server (stdio)" "$CHECK" --stdio "$SERVER"
-t "C++ client -> Python server (stdio)" "$CHECK" --stdio "$PY_NATIVE" tests/py_ref_server.py
+for M in auto legacy; do  # auto = 2026-07-28 per-request protocol, legacy = initialize handshake
+  L=""; [ "$M" = legacy ] && L="--legacy"
+  t "[$M] python client -> C++ server (stdio)" "$PY" tests/py_client_test.py stdio "$SERVER_NATIVE" $M
+  t "[$M] C++ client -> C++ server (stdio)" "$CHECK" $L --stdio "$SERVER"
+  t "[$M] C++ client -> Python server (stdio)" "$CHECK" $L --stdio "$PY_NATIVE" tests/py_ref_server.py
+done
 
 "$SERVER" --http 8000 > /dev/null 2>&1 & S1=$!
 "$PY" tests/py_ref_server.py --http 8001 > /dev/null 2>&1 & S2=$!
 for _ in $(seq 1 50); do curl -s -o /dev/null http://127.0.0.1:8001/mcp && curl -s -o /dev/null http://127.0.0.1:8000/mcp && break; sleep 0.2; done
-t "python client -> C++ server (http)" "$PY" tests/py_client_test.py http http://127.0.0.1:8000/mcp
-t "C++ client -> C++ server (http)" "$CHECK" --http http://127.0.0.1:8000/mcp
-t "C++ client -> Python server (http)" "$CHECK" --http http://127.0.0.1:8001/mcp
+for M in auto legacy; do
+  L=""; [ "$M" = legacy ] && L="--legacy"
+  t "[$M] python client -> C++ server (http)" "$PY" tests/py_client_test.py http http://127.0.0.1:8000/mcp $M
+  t "[$M] C++ client -> C++ server (http)" "$CHECK" $L --http http://127.0.0.1:8000/mcp
+  t "[$M] C++ client -> Python server (http)" "$CHECK" $L --http http://127.0.0.1:8001/mcp
+done
 kill $S1 $S2 2>/dev/null; wait $S1 $S2 2>/dev/null
 exit $fail

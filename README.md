@@ -29,17 +29,20 @@ int main() {
 | プロンプト | `srv.prompt(name, 説明, fn, 引数)`。fn は文字列か `std::vector<mcp::PromptMessage>` を返す |
 | トランスポート | stdio（改行区切り JSON）、Streamable HTTP（セッション ID、SSE で進捗を流す、Origin 検査、localhost に bind） |
 | クライアント | `mcp_client.hpp`：`mcp::Client::stdio({"cmd", "args"})`（子プロセスを起動）／`mcp::Client::http(url)`。tools / resources / prompts / progress / logging / ping |
-| プロトコル | `initialize` で始まる版（2025-11-25。2025-06-18 / 2025-03-26 / 2024-11-05 にも合わせる）。2026-07-28 の新方式（`server/discover`）のクライアントには「未対応」と返し、従来方式に切り替えてもらう |
+| プロトコル | 両方式に対応：新方式 2026-07-28（`server/discover`、リクエストごとの `_meta` envelope、セッション無し、`resultType` / `cacheScope` / `ttlMs`、HTTP のルーティングヘッダ `Mcp-Method` / `Mcp-Name` / `Mcp-Param-*` の照合）と、従来の `initialize` 方式（2025-11-25 / 2025-06-18 / 2025-03-26 / 2024-11-05）。stdio は最初のリクエストで方式が決まる。クライアントの `connect()` は新方式を試して、駄目なら従来方式に切り替える |
 
 ## 本家との相互運用（確認済み）
 
-公式 Python SDK（`mcp` 2.3.0）と、次の6通りすべてで同じ検査（ツール、構造化出力、エラー、画像、進捗、ログ、キャンセル、リソース、テンプレート、プロンプト、ping）が通る：
+公式 Python SDK（`mcp` 2.3.0）と、新方式（2026-07-28）・従来方式（2025-11-25）それぞれで、次の組み合わせすべてで同じ検査
+（ツール、構造化出力、エラー、画像、進捗、ログ、キャンセル、リソース、テンプレート、プロンプト）が通る（計12通り）：
 
 | クライアント | サーバ | stdio | HTTP |
 |---|---|---|---|
-| 公式 Python SDK | mcp_cpp | ✓ | ✓ |
-| mcp_cpp | mcp_cpp | ✓ | ✓ |
-| mcp_cpp | 公式 Python SDK（`tests/py_ref_server.py`） | ✓ | ✓ |
+| 公式 Python SDK | mcp_cpp | ✓ ✓ | ✓ ✓ |
+| mcp_cpp | mcp_cpp | ✓ ✓ | ✓ ✓ |
+| mcp_cpp | 公式 Python SDK（`tests/py_ref_server.py`） | ✓ ✓ | ✓ ✓ |
+
+（各セルの左が新方式、右が従来方式。Claude Code 2.1.316 からの利用も確認済み）
 
 ```sh
 PY=<mcp を入れた python> bash tests/run_tests.sh

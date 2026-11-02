@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Drive the C++ demo server with the official Python MCP SDK (pip install mcp).
 
-    python tests/py_client_test.py stdio build/Release/demo_server.exe
-    python tests/py_client_test.py http  http://127.0.0.1:8000/mcp     (demo_server --http 8000)
+    python tests/py_client_test.py stdio build/Release/demo_server.exe [auto|legacy]
+    python tests/py_client_test.py http  http://127.0.0.1:8000/mcp [auto|legacy]   (demo_server --http 8000)
+auto: the client probes server/discover and speaks the 2026-07-28 per-request protocol;
+legacy: the initialize handshake (2025-11-25).
 """
 import asyncio
 import base64
@@ -19,16 +21,18 @@ def check(cond, msg):
         raise AssertionError(msg)
 
 
-async def run(target):
+async def run(target, mode):
     logs = []
 
     async def on_log(params):
         logs.append(params.data)
 
-    async with Client(target, logging_callback=on_log) as c:
+    async with Client(target, logging_callback=on_log, mode=mode, log_level="info") as c:
         info = c.server_info
         check(info.name == "cpp-demo", info)
         print("connected:", info.name, info.version, "protocol", c.protocol_version)
+        modern = c.protocol_version == "2026-07-28"
+        check(modern == (mode == "auto"), f"mode {mode} negotiated {c.protocol_version}")
 
         tools = (await c.list_tools()).tools
         names = sorted(t.name for t in tools)
@@ -53,7 +57,8 @@ async def run(target):
         print("tools ok")
 
         # progress + logging
-        await c.set_logging_level("info")
+        if not modern:
+            await c.set_logging_level("info")  # modern: the per-request log_level above
         prog = []
 
         async def on_progress(p, total, message):
@@ -88,14 +93,16 @@ async def run(target):
         r = await c.get_prompt("review_code", {"code": "int x;", "language": "C++"})
         check("C++ code" in r.messages[0].content.text, r)
         print("prompts ok")
-        await c.send_ping()
+        if not modern:
+            await c.send_ping()  # removed in 2026-07-28
 
 
 def main():
-    mode, where = sys.argv[1], sys.argv[2]
-    target = StdioServerParameters(command=where) if mode == "stdio" else where
-    asyncio.run(run(target))
-    print(mode, "ALL OK")
+    kind, where = sys.argv[1], sys.argv[2]
+    mode = sys.argv[3] if len(sys.argv) > 3 else "auto"
+    target = StdioServerParameters(command=where) if kind == "stdio" else where
+    asyncio.run(run(target, mode))
+    print(kind, mode, "ALL OK")
 
 
 if __name__ == "__main__":
