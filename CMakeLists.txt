@@ -16,7 +16,7 @@ if(MSVC)
   target_compile_options(mcp_cpp INTERFACE /utf-8 /bigobj)
 endif()
 
-foreach(ex demo_server)
+foreach(ex demo_server client_check)
   add_executable(${ex} examples/${ex}.cpp)
   target_link_libraries(${ex} PRIVATE mcp_cpp)
 endforeach()
